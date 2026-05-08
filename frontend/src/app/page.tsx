@@ -1,5 +1,5 @@
-import WarrantyPanel from '@/components/WarrantyPanel';
 "use client";
+import WarrantyPanel from '@/components/WarrantyPanel';
 
 import {
   startTransition,
