@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "builds": [],
+  "routes": [
+    {
+      "src": "/.*",
+      "status": 404
+    }
+  ]
+}
