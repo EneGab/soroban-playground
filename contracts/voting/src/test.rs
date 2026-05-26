@@ -137,6 +137,40 @@ fn test_read_methods_fail_before_initialization() {
 }
 
 #[test]
+fn test_vote_rejects_invalid_state_when_previous_count_is_missing() {
+    let (env, client, admin, options) = setup();
+    client.initialize(&admin, &options);
+
+    let voter = Address::generate(&env);
+    let rust = symbol_short!("RUST");
+    let go = symbol_short!("GO");
+
+    client.vote(&voter, &rust);
+    set_count(&env, &rust, 0);
+
+    let result = client.try_vote(&voter, &go);
+    assert!(matches!(result, Err(Ok(Error::InvalidState))));
+}
+
+#[test]
+fn test_vote_rejects_before_initialization() {
+    let (env, client, _admin, _options) = setup();
+    let voter = Address::generate(&env);
+    let rust = symbol_short!("RUST");
+
+    let result = client.try_vote(&voter, &rust);
+    assert!(matches!(result, Err(Ok(Error::NotInitialized))));
+}
+
+#[test]
+fn test_has_voted_rejects_before_initialization() {
+    let (env, client, _admin, _options) = setup();
+    let voter = Address::generate(&env);
+
+    let result = client.try_has_voted(&voter);
+    assert!(matches!(result, Err(Ok(Error::NotInitialized))));
+}
+#[test]
 fn test_registered_option_queries_work() {
     let (_env, client, admin, options) = setup();
     client.initialize(&admin, &options);

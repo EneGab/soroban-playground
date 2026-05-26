@@ -51,7 +51,8 @@ impl VotingContract {
             }
 
             let current_count = get_count(&env, &current_option);
-            set_count(&env, &current_option, current_count - 1);
+            let updated_count = current_count.checked_sub(1).ok_or(Error::InvalidState)?;
+            set_count(&env, &current_option, updated_count);
         } else {
             increment_total_voters(&env);
         }

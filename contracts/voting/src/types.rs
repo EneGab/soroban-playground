@@ -9,6 +9,7 @@ pub enum Error {
     EmptyOptions = 3,
     DuplicateOption = 4,
     UnknownOption = 5,
+    InvalidState = 6,
 }
 
 #[contracttype]
