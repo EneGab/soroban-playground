@@ -1,14 +1,28 @@
 // Copyright (c) 2026 StellarDevTools
 // SPDX-License-Identifier: MIT
 
-//! # Multi-Signature Wallet with RBAC
+//! # Multisig Wallet
 //!
-//! Features:
-//! - Configurable M-of-N threshold (e.g. 2-of-3, 3-of-5).
-//! - Role-based access control: OWNER > ADMIN > OPERATOR > VIEWER.
-//! - 24-hour timelock on queued transactions.
-//! - Replay protection via per-signer approval tracking.
-//! - Daily withdrawal limit.
+//! A production-ready multi-signature wallet contract for decentralized
+//! governance on Soroban. It enables M-of-N approval over arbitrary
+//! operations with optional time-locked execution.
+//!
+//! ## Features
+//! - Configurable M-of-N approval threshold.
+//! - Time-locked execution (`min_delay` / `max_delay` window).
+//! - Queued transactions with cancellation and confirmation revocation.
+//! - Strict owner & threshold invariants.
+//! - Standard event emission: `Submission`, `Confirmation`, `Revocation`,
+//!   `Execution`, `Cancellation`, `OwnerAddition`, `OwnerRemoval`,
+//!   `ThresholdChange`, `DelayChange`.
+//!
+//! ## Lifecycle
+//! 1. Deploy + call `initialize` with the initial owners, threshold, and
+//!    delay window.
+//! 2. Owners call `submit_transaction` to queue an operation.
+//! 3. Distinct owners call `confirm_transaction` until the threshold is met.
+//! 4. After `min_delay` has elapsed, any owner calls `execute_transaction`.
+//! 5. `cancel_transaction` or `revoke_confirmation` can abort the flow.
 
 #![no_std]
 
@@ -16,24 +30,16 @@ mod storage;
 mod test;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Vec};
 
 use crate::storage::{
-    get_admin, get_daily_limit, get_daily_state, get_signer, get_signer_count, get_threshold,
-    get_tx, get_tx_count, has_approved, has_signer, is_initialized, record_approval,
-    remove_signer, role_of, set_admin, set_daily_limit, set_daily_state, set_signer,
-    set_signer_count, set_threshold, set_tx, set_tx_count,
+    get_max_delay, get_min_delay, get_threshold, get_tx, get_tx_count, has_owner, is_confirmed,
+    is_initialized, record_confirmation, remove_confirmation, set_initialized, set_max_delay,
+    set_min_delay, set_threshold, set_tx, set_tx_count,
 };
-use crate::types::{Error, Role, Signer, Transaction, TxStatus};
+use crate::types::{DataKey, Error, InstanceKey, Transaction, TxStatus};
 
-/// 24-hour timelock in seconds.
-const TIMELOCK_SECS: u64 = 86_400;
-/// Proposal expiry: 7 days.
-const EXPIRY_SECS: u64 = 604_800;
-/// Daily limit reset period in seconds.
-const DAY_SECS: u64 = 86_400;
-/// Maximum description length to prevent storage bloat.
-const MAX_DESCRIPTION_LENGTH: u32 = 500;
+// ── Contract entry point ──────────────────────────────────────────────────────
 
 #[contract]
 pub struct MultisigWallet;
@@ -42,285 +48,415 @@ pub struct MultisigWallet;
 impl MultisigWallet {
     // ── Initialisation ────────────────────────────────────────────────────────
 
-    /// Initialise the wallet with an owner, threshold, and optional daily limit.
+    /// Initialise the wallet with `owners`, an approval `threshold`, and a
+    /// delay window `[min_delay, max_delay]` (seconds). Must be called once.
     pub fn initialize(
         env: Env,
-        owner: Address,
+        owners: Vec<Address>,
         threshold: u32,
-        daily_limit: Option<i128>,
+        min_delay: u64,
+        max_delay: u64,
     ) -> Result<(), Error> {
         if is_initialized(&env) {
             return Err(Error::AlreadyInitialized);
         }
-        owner.require_auth();
-        
-        // Validate threshold
+        if owners.is_empty() {
+            return Err(Error::OwnerRequired);
+        }
         if threshold == 0 {
             return Err(Error::InvalidThreshold);
         }
-        
-        // Validate daily limit if provided
-        if let Some(limit) = daily_limit {
-            if limit <= 0 {
-                return Err(Error::InvalidThreshold);
+        if threshold > owners.len() {
+            return Err(Error::InvalidThreshold);
+        }
+        if min_delay > max_delay {
+            return Err(Error::InvalidDelay);
+        }
+
+        // Deduplicate owners.
+        let mut seen: Vec<Address> = Vec::new(&env);
+        for owner in owners.iter() {
+            if seen.contains(&owner) {
+                return Err(Error::DuplicateOwner);
             }
+            seen.push_back(owner.clone());
         }
-        
-        set_admin(&env, &owner);
+
+        // Persist owners.
+        env.storage()
+            .instance()
+            .set(&InstanceKey::OwnerCount, &seen.len());
+        for (i, owner) in seen.iter().enumerate() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::OwnerAt(i as u32), &owner);
+            env.storage()
+                .persistent()
+                .set(&DataKey::IsOwner(owner.clone()), &true);
+        }
+
         set_threshold(&env, threshold);
-        // Register the owner as the first signer.
-        set_signer(&env, &Signer { address: owner, role: Role::Owner });
-        set_signer_count(&env, 1);
-        if let Some(limit) = daily_limit {
-            set_daily_limit(&env, limit);
-        }
-        Ok(())
-    }
-
-    // ── Signer management ─────────────────────────────────────────────────────
-
-    /// Add a new signer. Requires ADMIN or OWNER role.
-    pub fn add_signer(env: Env, caller: Address, new_signer: Address, role: Role) -> Result<(), Error> {
-        ensure_initialized(&env)?;
-        caller.require_auth();
-        require_min_role(&env, &caller, Role::Admin)?;
-
-        if has_signer(&env, &new_signer) {
-            return Err(Error::SignerAlreadyExists);
-        }
-        // Cannot assign a role higher than the caller's own role.
-        if role > role_of(&env, &caller)? {
-            return Err(Error::Unauthorized);
-        }
-        set_signer(&env, &Signer { address: new_signer, role });
-        set_signer_count(&env, get_signer_count(&env) + 1);
+        set_min_delay(&env, min_delay);
+        set_max_delay(&env, max_delay);
+        set_tx_count(&env, 0);
+        set_initialized(&env);
 
         env.events().publish(
-            (soroban_sdk::symbol_short!("add_sgn"),),
-            role as u32,
+            (symbol_short!("Init"),),
+            (threshold, min_delay, max_delay),
         );
         Ok(())
     }
 
-    /// Remove a signer. Requires OWNER role.
-    pub fn remove_signer(env: Env, caller: Address, target: Address) -> Result<(), Error> {
+    // ── Owner management ─────────────────────────────────────────────────────
+
+    /// Add a new owner. Only callable by an existing owner.
+    pub fn add_owner(env: Env, caller: Address, new_owner: Address) -> Result<(), Error> {
         ensure_initialized(&env)?;
         caller.require_auth();
-        require_min_role(&env, &caller, Role::Owner)?;
+        require_owner(&env, &caller)?;
 
-        if !has_signer(&env, &target) {
-            return Err(Error::SignerNotFound);
+        if has_owner(&env, &new_owner) {
+            return Err(Error::OwnerExists);
         }
-        let count = get_signer_count(&env);
-        // Ensure threshold remains satisfiable.
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&InstanceKey::OwnerCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerAt(count), &new_owner);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IsOwner(new_owner.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&InstanceKey::OwnerCount, &(count + 1));
+
+        env.events()
+            .publish((symbol_short!("OwnerAdd"),), (caller, new_owner));
+        Ok(())
+    }
+
+    /// Remove an owner. Only callable by an existing owner. The remaining
+    /// owner count must still satisfy the current threshold.
+    pub fn remove_owner(env: Env, caller: Address, owner: Address) -> Result<(), Error> {
+        ensure_initialized(&env)?;
+        caller.require_auth();
+        require_owner(&env, &caller)?;
+
+        if !has_owner(&env, &owner) {
+            return Err(Error::OwnerNotFound);
+        }
+        if caller == owner {
+            return Err(Error::SelfRemoval);
+        }
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&InstanceKey::OwnerCount)
+            .unwrap_or(0);
         if count - 1 < get_threshold(&env) {
             return Err(Error::InvalidThreshold);
         }
-        remove_signer(&env, &target);
-        set_signer_count(&env, count - 1);
 
-        env.events().publish(
-            (soroban_sdk::symbol_short!("rm_sgn"),),
-            target,
-        );
+        // Find owner's index and swap with last.
+        let mut idx: Option<u32> = None;
+        for i in 0..count {
+            let cur: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OwnerAt(i))
+                .unwrap();
+            if cur == owner {
+                idx = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = idx {
+            let last_idx = count - 1;
+            if i != last_idx {
+                let last: Address = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::OwnerAt(last_idx))
+                    .unwrap();
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::OwnerAt(i), &last);
+            }
+            env.storage().persistent().remove(&DataKey::OwnerAt(last_idx));
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::IsOwner(owner.clone()));
+        env.storage()
+            .instance()
+            .set(&InstanceKey::OwnerCount, &(count - 1));
+
+        env.events()
+            .publish((symbol_short!("OwnerRem"),), (caller, owner));
         Ok(())
     }
 
-    /// Change the approval threshold. Requires OWNER role.
+    /// Replace the approval threshold. Must be in `[1, owner_count]`.
     pub fn change_threshold(env: Env, caller: Address, new_threshold: u32) -> Result<(), Error> {
         ensure_initialized(&env)?;
         caller.require_auth();
-        require_min_role(&env, &caller, Role::Owner)?;
+        require_owner(&env, &caller)?;
 
-        if new_threshold == 0 || new_threshold > get_signer_count(&env) {
+        if new_threshold == 0 {
+            return Err(Error::InvalidThreshold);
+        }
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&InstanceKey::OwnerCount)
+            .unwrap_or(0);
+        if new_threshold > count {
             return Err(Error::InvalidThreshold);
         }
         set_threshold(&env, new_threshold);
+        env.events()
+            .publish((symbol_short!("ThreshChg"),), (caller, new_threshold));
         Ok(())
     }
 
-    /// Update the daily withdrawal limit. Requires OWNER role.
-    pub fn set_daily_limit(env: Env, caller: Address, limit: i128) -> Result<(), Error> {
+    /// Update the delay window. Only callable by an existing owner.
+    pub fn update_delays(
+        env: Env,
+        caller: Address,
+        min_delay: u64,
+        max_delay: u64,
+    ) -> Result<(), Error> {
         ensure_initialized(&env)?;
         caller.require_auth();
-        require_min_role(&env, &caller, Role::Owner)?;
-        set_daily_limit(&env, limit);
+        require_owner(&env, &caller)?;
+
+        if min_delay > max_delay {
+            return Err(Error::InvalidDelay);
+        }
+        set_min_delay(&env, min_delay);
+        set_max_delay(&env, max_delay);
+        env.events()
+            .publish((symbol_short!("DelayChg"),), (caller, min_delay, max_delay));
         Ok(())
     }
 
-    // ── Transaction lifecycle ─────────────────────────────────────────────────
+    // ── Transaction lifecycle ────────────────────────────────────────────────
 
-    /// Propose a new transaction. Any OPERATOR or above may propose.
-    /// Returns the new transaction ID.
-    pub fn propose(
+    /// Submit a new transaction for approval. `delay` is the number of
+    /// seconds that must elapse after the threshold is reached before the
+    /// transaction can be executed. Must satisfy
+    /// `min_delay <= delay <= max_delay`.
+    pub fn submit_transaction(
         env: Env,
         proposer: Address,
-        description: String,
-        amount: i128,
-        recipient: Option<Address>,
+        target: Address,
+        value: i128,
+        data: String,
+        delay: u64,
     ) -> Result<u32, Error> {
         ensure_initialized(&env)?;
         proposer.require_auth();
-        require_min_role(&env, &proposer, Role::Operator)?;
+        require_owner(&env, &proposer)?;
 
-        // Validate description
-        if description.is_empty() {
-            return Err(Error::EmptyDescription);
+        if value < 0 {
+            return Err(Error::InvalidValue);
         }
-        
-        // Validate description length to prevent storage bloat
-        if description.len() > MAX_DESCRIPTION_LENGTH {
-            return Err(Error::EmptyDescription);
+        if data.is_empty() {
+            return Err(Error::EmptyData);
         }
-        
-        // Validate amount
-        if amount < 0 {
-            return Err(Error::InvalidThreshold);
+        if data.len() > MAX_DATA_LENGTH {
+            return Err(Error::DataTooLong);
+        }
+        if delay < get_min_delay(&env) || delay > get_max_delay(&env) {
+            return Err(Error::InvalidDelay);
         }
 
         let now = env.ledger().timestamp();
         let id = get_tx_count(&env);
         let tx = Transaction {
             id,
-            proposer,
-            description,
-            amount,
-            recipient,
+            proposer: proposer.clone(),
+            target: target.clone(),
+            value,
+            data: data.clone(),
             status: TxStatus::Pending,
-            approvals: 0,
+            confirmations: 0,
             created_at: now,
-            execute_after: now + TIMELOCK_SECS,
-            expires_at: now + EXPIRY_SECS,
+            delay,
+            execute_after: 0,
         };
         set_tx(&env, &tx);
         set_tx_count(&env, id + 1);
 
-        env.events().publish(
-            (soroban_sdk::symbol_short!("proposed"),),
-            id,
-        );
+        env.events()
+            .publish((symbol_short!("Submit"),), (id, proposer));
         Ok(id)
     }
 
-    /// Approve a pending transaction. Any OPERATOR or above may approve.
-    /// When approvals reach the threshold the tx moves to Queued.
-    pub fn approve(env: Env, signer: Address, tx_id: u32) -> Result<(), Error> {
+    /// Confirm a pending transaction. The caller must be an owner and must
+    /// not have already confirmed the transaction. When the threshold is
+    /// reached the transaction becomes `Ready` and its `execute_after` is
+    /// set to `now + delay`.
+    pub fn confirm_transaction(env: Env, owner: Address, tx_id: u32) -> Result<(), Error> {
         ensure_initialized(&env)?;
-        signer.require_auth();
-        require_min_role(&env, &signer, Role::Operator)?;
+        owner.require_auth();
+        require_owner(&env, &owner)?;
 
         let mut tx = get_tx(&env, tx_id)?;
-        let now = env.ledger().timestamp();
-
-        // Check transaction status
         if tx.status != TxStatus::Pending {
-            return Err(Error::TransactionNotPending);
+            return Err(Error::WrongStatus);
         }
-        
-        // Check if transaction has expired
-        if is_transaction_expired(now, tx.expires_at) {
-            tx.status = TxStatus::Expired;
-            set_tx(&env, &tx);
-            return Err(Error::TransactionExpired);
-        }
-        
-        // Check for duplicate approval
-        if has_approved(&env, tx_id, &signer) {
-            return Err(Error::AlreadyApproved);
+        if is_confirmed(&env, tx_id, &owner) {
+            return Err(Error::AlreadyConfirmed);
         }
 
-        record_approval(&env, tx_id, &signer);
-        tx.approvals += 1;
+        record_confirmation(&env, tx_id, &owner);
+        tx.confirmations += 1;
 
-        // Move to queued if threshold reached
-        if tx.approvals >= get_threshold(&env) {
-            tx.status = TxStatus::Queued;
-            env.events().publish(
-                (soroban_sdk::symbol_short!("queued"),),
-                tx_id,
-            );
+        if tx.confirmations >= get_threshold(&env) {
+            tx.status = TxStatus::Ready;
+            tx.execute_after = env.ledger().timestamp() + tx.delay;
         }
         set_tx(&env, &tx);
+
+        env.events()
+            .publish((symbol_short!("Confirm"),), (tx_id, owner));
         Ok(())
     }
 
-    /// Execute a queued transaction after the timelock has elapsed.
-    /// Requires ADMIN or OWNER role.
-    pub fn execute(env: Env, caller: Address, tx_id: u32) -> Result<(), Error> {
+    /// Revoke a previously-submitted confirmation. Only allowed while the
+    /// transaction is still `Pending` or `Ready`. After revocation, if the
+    /// transaction was `Ready` and confirmations drop below the threshold
+    /// it returns to `Pending` and `execute_after` is reset.
+    pub fn revoke_confirmation(env: Env, owner: Address, tx_id: u32) -> Result<(), Error> {
         ensure_initialized(&env)?;
-        caller.require_auth();
-        require_min_role(&env, &caller, Role::Admin)?;
+        owner.require_auth();
+        require_owner(&env, &owner)?;
 
         let mut tx = get_tx(&env, tx_id)?;
-        let now = env.ledger().timestamp();
-
-        // Check transaction status
-        if tx.status != TxStatus::Queued {
-            return Err(Error::TransactionNotQueued);
+        if tx.status != TxStatus::Pending && tx.status != TxStatus::Ready {
+            return Err(Error::WrongStatus);
         }
-        
-        // Check if timelock has passed
-        if !is_timelock_passed(now, tx.execute_after) {
-            return Err(Error::TimelockActive);
-        }
-        
-        // Check if transaction has expired
-        if is_transaction_expired(now, tx.expires_at) {
-            tx.status = TxStatus::Expired;
-            set_tx(&env, &tx);
-            return Err(Error::TransactionExpired);
+        if !is_confirmed(&env, tx_id, &owner) {
+            return Err(Error::NotConfirmed);
         }
 
-        // Enforce daily withdrawal limit for XLM transfers
-        if tx.amount > 0 {
-            check_and_update_daily_limit(&env, tx.amount)?;
+        remove_confirmation(&env, tx_id, &owner);
+        tx.confirmations -= 1;
+
+        if tx.status == TxStatus::Ready && tx.confirmations < get_threshold(&env) {
+            tx.status = TxStatus::Pending;
+            tx.execute_after = 0;
+        }
+        set_tx(&env, &tx);
+
+        env.events()
+            .publish((symbol_short!("Revoke"),), (tx_id, owner));
+        Ok(())
+    }
+
+    /// Execute a `Ready` transaction whose delay has elapsed. Marks the
+    /// transaction `Executed`. The transfer of `value` to `target` is the
+    /// responsibility of the inheriting integration; this contract enforces
+    /// the governance path.
+    pub fn execute_transaction(env: Env, caller: Address, tx_id: u32) -> Result<(), Error> {
+        ensure_initialized(&env)?;
+        caller.require_auth();
+        require_owner(&env, &caller)?;
+
+        let mut tx = get_tx(&env, tx_id)?;
+        if tx.status != TxStatus::Ready {
+            return Err(Error::WrongStatus);
+        }
+        if env.ledger().timestamp() < tx.execute_after {
+            return Err(Error::DelayNotElapsed);
         }
 
         tx.status = TxStatus::Executed;
         set_tx(&env, &tx);
 
-        env.events().publish(
-            (soroban_sdk::symbol_short!("executed"),),
-            tx_id,
-        );
+        env.events()
+            .publish((symbol_short!("Execute"),), (tx_id, caller));
         Ok(())
     }
 
-    /// Cancel a pending or queued transaction. Requires ADMIN or OWNER role.
-    pub fn cancel(env: Env, caller: Address, tx_id: u32) -> Result<(), Error> {
+    /// Cancel a transaction. Caller must be the proposer or any owner.
+    /// Cancellation is only allowed while the transaction is not yet
+    /// `Executed` or `Cancelled`.
+    pub fn cancel_transaction(env: Env, caller: Address, tx_id: u32) -> Result<(), Error> {
         ensure_initialized(&env)?;
         caller.require_auth();
-        require_min_role(&env, &caller, Role::Admin)?;
+        require_owner(&env, &caller)?;
 
         let mut tx = get_tx(&env, tx_id)?;
-        if tx.status != TxStatus::Pending && tx.status != TxStatus::Queued {
-            return Err(Error::TransactionNotPending);
+        if tx.status == TxStatus::Executed || tx.status == TxStatus::Cancelled {
+            return Err(Error::WrongStatus);
         }
+        // Proposer can cancel even if the proposer is the caller.
+        // (caller.require_auth + require_owner already enforced above.)
+
         tx.status = TxStatus::Cancelled;
         set_tx(&env, &tx);
 
-        env.events().publish(
-            (soroban_sdk::symbol_short!("cancelled"),),
-            tx_id,
-        );
+        env.events()
+            .publish((symbol_short!("Cancel"),), (tx_id, caller));
         Ok(())
     }
 
-    // ── Read-only queries ─────────────────────────────────────────────────────
+    // ── Read-only queries ────────────────────────────────────────────────────
+
+    pub fn get_owners(env: Env) -> Result<Vec<Address>, Error> {
+        ensure_initialized(&env)?;
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&InstanceKey::OwnerCount)
+            .unwrap_or(0);
+        let mut out: Vec<Address> = Vec::new(&env);
+        for i in 0..count {
+            let a: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OwnerAt(i))
+                .unwrap();
+            out.push_back(a);
+        }
+        Ok(out)
+    }
+
+    pub fn get_owner_count(env: Env) -> Result<u32, Error> {
+        ensure_initialized(&env)?;
+        Ok(env
+            .storage()
+            .instance()
+            .get(&InstanceKey::OwnerCount)
+            .unwrap_or(0))
+    }
+
+    pub fn is_owner(env: Env, addr: Address) -> Result<bool, Error> {
+        ensure_initialized(&env)?;
+        Ok(has_owner(&env, &addr))
+    }
 
     pub fn get_threshold(env: Env) -> Result<u32, Error> {
         ensure_initialized(&env)?;
         Ok(get_threshold(&env))
     }
 
-    pub fn get_signer_count(env: Env) -> Result<u32, Error> {
+    pub fn get_min_delay(env: Env) -> Result<u64, Error> {
         ensure_initialized(&env)?;
-        Ok(get_signer_count(&env))
+        Ok(get_min_delay(&env))
     }
 
-    pub fn get_signer(env: Env, addr: Address) -> Result<Signer, Error> {
+    pub fn get_max_delay(env: Env) -> Result<u64, Error> {
         ensure_initialized(&env)?;
-        get_signer(&env, &addr)
+        Ok(get_max_delay(&env))
     }
 
     pub fn get_transaction(env: Env, tx_id: u32) -> Result<Transaction, Error> {
@@ -328,25 +464,20 @@ impl MultisigWallet {
         get_tx(&env, tx_id)
     }
 
-    pub fn get_tx_count(env: Env) -> Result<u32, Error> {
+    pub fn get_transaction_count(env: Env) -> Result<u32, Error> {
         ensure_initialized(&env)?;
         Ok(get_tx_count(&env))
     }
 
-    pub fn has_approved(env: Env, tx_id: u32, signer: Address) -> Result<bool, Error> {
+    pub fn is_confirmed(env: Env, tx_id: u32, owner: Address) -> Result<bool, Error> {
         ensure_initialized(&env)?;
-        Ok(has_approved(&env, tx_id, &signer))
-    }
-
-    pub fn get_daily_limit(env: Env) -> Result<i128, Error> {
-        ensure_initialized(&env)?;
-        Ok(get_daily_limit(&env))
-    }
-
-    pub fn get_admin(env: Env) -> Result<Address, Error> {
-        get_admin(&env)
+        Ok(is_confirmed(&env, tx_id, &owner))
     }
 }
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const MAX_DATA_LENGTH: u32 = 256;
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -357,42 +488,9 @@ fn ensure_initialized(env: &Env) -> Result<(), Error> {
     Ok(())
 }
 
-fn require_min_role(env: &Env, addr: &Address, min: Role) -> Result<(), Error> {
-    if role_of(env, addr)? < min {
+fn require_owner(env: &Env, addr: &Address) -> Result<(), Error> {
+    if !has_owner(env, addr) {
         return Err(Error::Unauthorized);
     }
     Ok(())
-}
-
-/// Resets the daily counter if a new day has started, then checks the limit.
-fn check_and_update_daily_limit(env: &Env, amount: i128) -> Result<(), Error> {
-    let now = env.ledger().timestamp();
-    let (mut withdrawn, day_start) = get_daily_state(env);
-
-    // Reset counter if new day has started
-    if now >= day_start + DAY_SECS {
-        withdrawn = 0;
-    }
-
-    let limit = get_daily_limit(env);
-    
-    // Check if amount would exceed daily limit
-    if withdrawn + amount > limit {
-        return Err(Error::DailyLimitExceeded);
-    }
-
-    // Update daily state
-    let new_day_start = if now >= day_start + DAY_SECS { now } else { day_start };
-    set_daily_state(env, withdrawn + amount, new_day_start);
-    Ok(())
-}
-
-/// Check if a transaction has expired based on current time
-fn is_transaction_expired(now: u64, expires_at: u64) -> bool {
-    now > expires_at
-}
-
-/// Check if timelock has passed for a transaction
-fn is_timelock_passed(now: u64, execute_after: u64) -> bool {
-    now >= execute_after
 }

@@ -2808,6 +2808,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "soroban-multisig-wallet"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "soroban-playground-indexer"
 version = "0.1.0"
 dependencies = [
