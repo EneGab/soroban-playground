@@ -4,10 +4,11 @@
 import redisService from '../services/redisService.js';
 import { getStrategy } from '../services/rateLimitStrategies.js';
 import { createHttpError } from './errorHandler.js';
+import config from '../config/index.js';
 
 /**
  * Production-grade Rate Limiter Middleware
- * @param {Object} options 
+ * @param {Object} options
  * @param {number} options.limit - Max requests in window
  * @param {number} options.windowMs - Window size in milliseconds
  * @param {string} options.strategyName - Strategy name (FixedWindow, SlidingWindowLog, SlidingWindowCounter)
@@ -18,7 +19,7 @@ export const rateLimiter = (options = {}) => {
     limit = 100,
     windowMs = 60 * 1000,
     strategyName = 'SlidingWindowCounter',
-    identifier = 'ip'
+    identifier = 'ip',
   } = options;
 
   const strategy = getStrategy(strategyName);
@@ -51,13 +52,18 @@ export const rateLimiter = (options = {}) => {
       });
 
       if (!result.allowed) {
-        res.set('Retry-After', String(result.retryAfter || Math.ceil(windowMs / 1000)));
-        
+        res.set(
+          'Retry-After',
+          String(result.retryAfter || Math.ceil(windowMs / 1000))
+        );
+
         await redisService.logAnalytics(req.originalUrl, id, 'blocked');
-        
-        return next(createHttpError(429, 'Too Many Requests', { 
-          retryAfter: result.retryAfter 
-        }));
+
+        return next(
+          createHttpError(429, 'Too Many Requests', {
+            retryAfter: result.retryAfter,
+          })
+        );
       }
 
       await redisService.logAnalytics(req.originalUrl, id, 'allowed');
@@ -67,4 +73,27 @@ export const rateLimiter = (options = {}) => {
       next(); // Fail open to maintain availability during service failure
     }
   };
+};
+
+/**
+ * Factory function to create rate limit middleware with config
+ * @param {string} configKey - Key from config.rateLimit (e.g., 'global', 'compile')
+ * @returns {Function} Express middleware function
+ */
+export const rateLimitMiddleware = (configKey) => {
+  const rateLimitConfig =
+    config.rateLimit[configKey] || config.rateLimit['global'];
+
+  if (!rateLimitConfig) {
+    throw new Error(
+      `Rate limit config not found for key: ${configKey} and fallback 'global' also not found`
+    );
+  }
+
+  return rateLimiter({
+    limit: rateLimitConfig.max,
+    windowMs: rateLimitConfig.windowMs,
+    strategyName: 'SlidingWindowCounter',
+    identifier: 'ip',
+  });
 };

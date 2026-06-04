@@ -8,6 +8,15 @@ import { sharedOracleEventBus } from './services/oracle/oracleEvents.js';
 
 const clients = new Set();
 
+export function broadcastTreasuryEvent(event) {
+  const message = JSON.stringify({ type: 'treasury-event', ...event });
+  for (const socket of clients) {
+    if (socket.readyState === socket.OPEN) {
+      socket.send(message);
+    }
+  }
+}
+
 export function setupWebsocketServer(httpServer) {
   const wss = new WebSocketServer({
     server: httpServer,
@@ -67,22 +76,34 @@ export function setupWebsocketServer(httpServer) {
 
   // Broadcast analytics every 2 seconds
   setInterval(async () => {
-    if (clients.size === 0 || redisService.isFallbackMode || !redisService.client) return;
-    
+    if (
+      clients.size === 0 ||
+      redisService.isFallbackMode ||
+      !redisService.client
+    )
+      return;
+
     try {
-      const topIps = await redisService.client.zrevrange('analytics:top_ips', 0, 9, 'WITHSCORES');
+      const topIps = await redisService.client.zrevrange(
+        'analytics:top_ips',
+        0,
+        9,
+        'WITHSCORES'
+      );
       const endpoints = ['compile', 'invoke', 'deploy', 'global'];
       const stats = {};
-      
+
       for (const endpoint of endpoints) {
-        stats[endpoint] = await redisService.client.hgetall(`analytics:endpoint:${endpoint}`);
+        stats[endpoint] = await redisService.client.hgetall(
+          `analytics:endpoint:${endpoint}`
+        );
       }
 
       const message = JSON.stringify({
         type: 'rate-limit-analytics',
         timestamp: new Date().toISOString(),
         topIps,
-        stats
+        stats,
       });
 
       for (const socket of clients) {
@@ -96,4 +117,13 @@ export function setupWebsocketServer(httpServer) {
   }, 2000);
 
   return wss;
+}
+
+export function broadcast(payload) {
+  const message = JSON.stringify(payload);
+  for (const socket of clients) {
+    if (socket.readyState === socket.OPEN) {
+      socket.send(message);
+    }
+  }
 }

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StellarDevTools
+// SPDX-License-Identifier: MIT
+
 #![no_std]
 
 mod storage;
@@ -6,13 +9,13 @@ mod types;
 #[cfg(test)]
 mod test;
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String};
 
 use crate::storage::{
     credential_count, get_admin, has_identity, is_initialized, load_credential, load_identity,
     next_credential_id, save_credential, save_identity, set_admin,
 };
-use crate::types::{Credential, CredentialStatus, Error, Identity};
+use crate::types::{Credential, CredentialStatus, Error, Identity, ReputationTier};
 
 #[contract]
 pub struct DidRegistry;
@@ -29,8 +32,6 @@ impl DidRegistry {
     }
 
     /// Register a new DID for the caller.
-    /// `did` — the DID string (e.g. "did:soroban:G...")
-    /// `metadata_hash` — u64 hash of off-chain metadata
     pub fn register_identity(
         env: Env,
         owner: Address,
@@ -61,11 +62,7 @@ impl DidRegistry {
     }
 
     /// Update metadata hash for an existing identity.
-    pub fn update_metadata(
-        env: Env,
-        owner: Address,
-        metadata_hash: u64,
-    ) -> Result<(), Error> {
+    pub fn update_metadata(env: Env, owner: Address, metadata_hash: u64) -> Result<(), Error> {
         ensure_initialized(&env)?;
         owner.require_auth();
 
@@ -84,7 +81,6 @@ impl DidRegistry {
         ensure_initialized(&env)?;
         let admin = get_admin(&env)?;
 
-        // Allow owner or admin
         if owner != admin {
             owner.require_auth();
         } else {
@@ -99,7 +95,6 @@ impl DidRegistry {
     }
 
     /// Issue a verifiable credential to a subject.
-    /// Only callable by a registered, active identity (the issuer).
     pub fn issue_credential(
         env: Env,
         issuer: Address,
@@ -111,12 +106,10 @@ impl DidRegistry {
         ensure_initialized(&env)?;
         issuer.require_auth();
 
-        // Issuer must have an active identity
         let issuer_identity = load_identity(&env, &issuer)?;
         if !issuer_identity.active {
             return Err(Error::IdentityDeactivated);
         }
-        // Subject must also be registered
         if !has_identity(&env, &subject) {
             return Err(Error::IdentityNotFound);
         }
@@ -138,11 +131,10 @@ impl DidRegistry {
         Ok(id)
     }
 
-    /// Revoke a credential (issuer or admin only).
+    /// Revoke a credential (admin only).
     pub fn revoke_credential(env: Env, credential_id: u32) -> Result<(), Error> {
         ensure_initialized(&env)?;
-        let admin = get_admin(&env)?;
-        admin.require_auth();
+        require_admin_auth(&env)?;
 
         let mut cred = load_credential(&env, credential_id)?;
         if cred.status == CredentialStatus::Revoked {
@@ -154,24 +146,10 @@ impl DidRegistry {
     }
 
     /// Adjust reputation score for an identity (admin only).
-    /// `delta` can be positive or negative.
-    pub fn adjust_reputation(
-        env: Env,
-        subject: Address,
-        delta: i32,
-    ) -> Result<i32, Error> {
+    pub fn adjust_reputation(env: Env, subject: Address, delta: i32) -> Result<i32, Error> {
         ensure_initialized(&env)?;
-        let admin = get_admin(&env)?;
-        admin.require_auth();
-
-        let mut identity = load_identity(&env, &subject)?;
-        if !identity.active {
-            return Err(Error::IdentityDeactivated);
-        }
-        identity.reputation = identity.reputation.saturating_add(delta);
-        identity.updated_at = env.ledger().timestamp();
-        save_identity(&env, &identity);
-        Ok(identity.reputation)
+        require_admin_auth(&env)?;
+        apply_reputation_delta(&env, &subject, delta)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -191,11 +169,138 @@ impl DidRegistry {
     pub fn is_initialized(env: Env) -> bool {
         is_initialized(&env)
     }
+
+    // ── Credential Verification ────────────────────────────────────────────
+
+    /// Verify a credential. Verifier must have an active identity.
+    pub fn verify_credential(
+        env: Env,
+        verifier: Address,
+        credential_id: u32,
+    ) -> Result<bool, Error> {
+        ensure_initialized(&env)?;
+        verifier.require_auth();
+
+        let verifier_identity = load_identity(&env, &verifier)?;
+        if !verifier_identity.active {
+            return Err(Error::IdentityDeactivated);
+        }
+
+        let cred = load_credential(&env, credential_id)?;
+        let now = env.ledger().timestamp();
+        let is_valid = is_credential_valid(&cred, now);
+
+        // Mark as expired if applicable
+        if !is_valid && cred.status == CredentialStatus::Active && cred.expires_at > 0 && cred.expires_at <= now {
+            let mut updated = cred;
+            updated.status = CredentialStatus::Expired;
+            save_credential(&env, &updated);
+        }
+
+        env.events().publish((symbol_short!("verify"),), (credential_id, is_valid));
+        Ok(is_valid)
+    }
+
+    // ── Reputation System ──────────────────────────────────────────────────
+
+    /// Get reputation tier for an identity.
+    pub fn get_reputation_tier(env: Env, identity: Address) -> Result<ReputationTier, Error> {
+        ensure_initialized(&env)?;
+        let id = load_identity(&env, &identity)?;
+        Ok(reputation_tier(id.reputation))
+    }
+
+    /// Boost reputation for verified actions (admin only, amount must be > 0).
+    pub fn boost_reputation(env: Env, subject: Address, amount: i32) -> Result<i32, Error> {
+        ensure_initialized(&env)?;
+        require_admin_auth(&env)?;
+        if amount <= 0 {
+            return Err(Error::InvalidReputation);
+        }
+        let score = apply_reputation_delta(&env, &subject, amount)?;
+        env.events().publish((symbol_short!("boost"),), (&subject, amount));
+        Ok(score)
+    }
+
+    /// Penalize reputation for violations (admin only, amount must be > 0).
+    pub fn penalize_reputation(env: Env, subject: Address, amount: i32) -> Result<i32, Error> {
+        ensure_initialized(&env)?;
+        require_admin_auth(&env)?;
+        if amount <= 0 {
+            return Err(Error::InvalidReputation);
+        }
+        let score = apply_reputation_delta(&env, &subject, -amount)?;
+        env.events().publish((symbol_short!("penalize"),), (&subject, amount));
+        Ok(score)
+    }
+
+    /// Check if identity meets minimum reputation requirement.
+    pub fn meets_reputation_requirement(
+        env: Env,
+        identity: Address,
+        min_reputation: i32,
+    ) -> Result<bool, Error> {
+        ensure_initialized(&env)?;
+        let id = load_identity(&env, &identity)?;
+        Ok(id.reputation >= min_reputation)
+    }
+
+    /// Check if a credential is expired.
+    pub fn is_credential_expired(env: Env, credential_id: u32) -> Result<bool, Error> {
+        ensure_initialized(&env)?;
+        let cred = load_credential(&env, credential_id)?;
+        let now = env.ledger().timestamp();
+        let expired = match cred.status {
+            CredentialStatus::Expired => true,
+            CredentialStatus::Active => cred.expires_at > 0 && cred.expires_at <= now,
+            _ => false,
+        };
+        Ok(expired)
+    }
 }
+
+// ── Private helpers ───────────────────────────────────────────────────────────
 
 fn ensure_initialized(env: &Env) -> Result<(), Error> {
     if !is_initialized(env) {
         return Err(Error::NotInitialized);
     }
     Ok(())
+}
+
+fn require_admin_auth(env: &Env) -> Result<(), Error> {
+    let admin = get_admin(env)?;
+    admin.require_auth();
+    Ok(())
+}
+
+/// Apply a signed delta to an identity's reputation. Returns the new score.
+fn apply_reputation_delta(env: &Env, subject: &Address, delta: i32) -> Result<i32, Error> {
+    let mut identity = load_identity(env, subject)?;
+    if !identity.active {
+        return Err(Error::IdentityDeactivated);
+    }
+    identity.reputation = identity.reputation.saturating_add(delta);
+    identity.updated_at = env.ledger().timestamp();
+    save_identity(env, &identity);
+    Ok(identity.reputation)
+}
+
+/// Determine the reputation tier for a given score.
+fn reputation_tier(score: i32) -> ReputationTier {
+    match score {
+        r if r < 0 => ReputationTier::Unverified,
+        r if r < 100 => ReputationTier::Novice,
+        r if r < 500 => ReputationTier::Trusted,
+        r if r < 1000 => ReputationTier::Verified,
+        _ => ReputationTier::Expert,
+    }
+}
+
+/// Check if a credential is currently valid (active and not expired).
+fn is_credential_valid(cred: &Credential, now: u64) -> bool {
+    match cred.status {
+        CredentialStatus::Active => cred.expires_at == 0 || cred.expires_at > now,
+        _ => false,
+    }
 }
