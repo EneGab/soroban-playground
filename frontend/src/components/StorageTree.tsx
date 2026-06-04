@@ -3,6 +3,8 @@
 import React, { useState } from "react";
 import { ChevronRight, ChevronDown } from "lucide-react";
 import DataTypeFormatter, { detectType } from "./DataTypeFormatter";
+import type { LedgerState } from "@/utils/transactionGraph";
+
 export type DiffKind = "added" | "removed" | "changed" | "unchanged";
 
 interface StorageEntry {
