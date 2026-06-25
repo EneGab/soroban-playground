@@ -218,3 +218,27 @@ CREATE TABLE IF NOT EXISTS favorites (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(wallet_address)
 );
+
+-- Feature flags and cohort overrides (issue #754)
+-- enabled=0 acts as a global kill switch and cannot be bypassed by cohort overrides.
+-- rollout_pct=0 means disabled for all users; 100 means enabled for all.
+CREATE TABLE IF NOT EXISTS feature_flags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    rollout_pct REAL NOT NULL DEFAULT 0 CHECK (rollout_pct >= 0 AND rollout_pct <= 100),
+    description TEXT NOT NULL DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Per-cohort (user/org/segment) overrides for specific flags.
+-- Takes precedence over rollout percentage but NOT over the global kill switch (enabled=0).
+CREATE TABLE IF NOT EXISTS flag_cohorts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flag_key TEXT NOT NULL REFERENCES feature_flags(key) ON DELETE CASCADE,
+    cohort_id TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(flag_key, cohort_id)
+);

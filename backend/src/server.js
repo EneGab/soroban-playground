@@ -30,6 +30,10 @@ import yieldOptimizerRoute from './routes/yieldOptimizer.js';
 import reitRoute from './routes/reit.js';
 import { setupGraphQL } from './graphql/index.js';
 import { initializeDatabase } from './database/connection.js';
+import { compressionMiddleware } from './middleware/compressionMiddleware.js';
+import feeEngineRoute from './routes/feeEngine.js';
+import featureFlagsRoute from './routes/featureFlags.js';
+import featureFlagService from './services/featureFlagService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -58,6 +62,7 @@ try {
 app.use(morgan('combined'));
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '5mb' }));
+app.use(compressionMiddleware);
 
 // Latency tracking middleware
 app.use((req, res, next) => {
@@ -93,6 +98,8 @@ app.use('/api/sports-markets', sportsPredictionMarketRoute);
 app.use('/api/warranty', warrantyManagementRoute);
 app.use('/api/yield-optimizer', yieldOptimizerRoute);
 app.use('/api/reit', reitRoute);
+app.use('/api/fee-engine', feeEngineRoute);
+app.use('/api/feature-flags', featureFlagsRoute);
 app.use('/metrics', metricsRoute);
 
 // GraphQL Endpoint
@@ -197,6 +204,7 @@ initializeDatabase()
     initializeCompileService().catch(console.error);
     oracleWorkerPool.start();
     startCleanupWorker();
+    featureFlagService.initSubscriber();
 
     // Start listening
     server.listen(PORT, () => {
