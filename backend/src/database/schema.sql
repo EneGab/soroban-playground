@@ -1,5 +1,30 @@
 -- Enhanced Database Schema for Production-Grade Search System
 
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Files table
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER,
+    uploader_id INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    filepath TEXT NOT NULL,
+    mimetype TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    FOREIGN KEY (uploader_id) REFERENCES users(id)
+);
+
 -- Projects table with full-text search support
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,3 +312,30 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status_next
     ON webhook_deliveries (status, next_attempt_at)
     WHERE status IN ('pending', 'retrying');
+-- Offline sync log for client transaction replay and conflict resolution (issue #764)
+CREATE TABLE IF NOT EXISTS sync_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('insert', 'update', 'delete')),
+    payload TEXT NOT NULL DEFAULT '{}',
+    client_timestamp DATETIME NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'conflict', 'error')),
+    error_message TEXT,
+    synced_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_logs_table_record ON sync_logs(table_name, record_id);
+CREATE INDEX IF NOT EXISTS idx_sync_logs_status ON sync_logs(status);
+CREATE INDEX IF NOT EXISTS idx_sync_logs_client_timestamp ON sync_logs(client_timestamp);
+
+-- Missing indexes for performance optimization
+CREATE INDEX IF NOT EXISTS idx_treasury_proposals_status ON treasury_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_treasury_proposals_expires_at ON treasury_proposals(expires_at);
+CREATE INDEX IF NOT EXISTS idx_treasury_proposals_execute_after ON treasury_proposals(execute_after);
+CREATE INDEX IF NOT EXISTS idx_treasury_approvals_proposal_id ON treasury_approvals(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_treasury_history_event_type ON treasury_history(event_type);
+CREATE INDEX IF NOT EXISTS idx_feature_flags_enabled ON feature_flags(enabled);
+CREATE INDEX IF NOT EXISTS idx_flag_cohorts_flag_key ON flag_cohorts(flag_key);
+CREATE INDEX IF NOT EXISTS idx_flag_cohorts_cohort_id ON flag_cohorts(cohort_id);
+
