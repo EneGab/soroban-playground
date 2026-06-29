@@ -47,6 +47,7 @@ import featureFlagService from './services/featureFlagService.js';
 import { LedgerSyncService } from './services/ledgerSyncService.js';
 import snippetsRoute from './routes/snippets.js';
 import deployQueueRoute from './routes/deployQueue.js';
+import predictionMarketRoute from './routes/predictionMarket.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -178,6 +179,7 @@ app.use('/api/batch', batchSubmitterRoute);
 app.use('/api/credentials', credentialsRoute);
 app.use('/api/snippets', snippetsRoute);
 app.use('/api/deploy-queue', deployQueueRoute);
+app.use('/api/prediction-market', predictionMarketRoute);
 app.use('/metrics', metricsRoute);
 
 // GraphQL Endpoint
