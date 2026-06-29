@@ -32,5 +32,9 @@ members = [
     "contracts/synthetic-assets",
     "contracts/patent-registry",
     "contracts/dutch-auction",
+    "contracts/cross-chain-bridge",
+    "contracts/twap-oracle",
+    "contracts/parametric-insurance",
+    "contracts/token_contract",
     "contracts/yield-optimizer",
 ]
