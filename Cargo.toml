@@ -31,5 +31,6 @@ members = [
     "contracts/migration-utils",
     "contracts/synthetic-assets",
     "contracts/patent-registry",
+    "contracts/dutch-auction",
     "contracts/yield-optimizer",
 ]
