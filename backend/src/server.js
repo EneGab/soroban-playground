@@ -52,7 +52,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const server = http.createServer(app);
+let server = http.createServer(app);
 applyServerTuning(server); // HTTP/2: keep-alive + headers-timeout tuning
 
 // TLS/SSL Hardening configuration
@@ -96,7 +96,7 @@ try {
 }
 
 // Fallback to HTTP if no certs are provided, otherwise use HTTPS
-const server = hasCertificates
+server = hasCertificates
   ? https.createServer(httpsOptions, app)
   : http.createServer(app);
 const PORT = process.env.PORT || 5000;
