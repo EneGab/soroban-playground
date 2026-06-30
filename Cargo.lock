@@ -2731,6 +2731,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "soroban-did-registry"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "soroban-dutch-auction-contract"
 version = "0.1.0"
 dependencies = [
@@ -2826,6 +2833,13 @@ dependencies = [
  "soroban-env-common",
  "soroban-env-host",
  "thiserror",
+]
+
+[[package]]
+name = "soroban-multisig-wallet"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]
