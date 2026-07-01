@@ -16,9 +16,9 @@ import { corsOptions } from './config/cors.js';
 import { applyServerTuning } from './config/http2Config.js';
 import { http2PushMiddleware } from './middleware/http2Push.js';
 import apiRouter from './routes/api.js';
-import { startCleanupWorker } from './cleanupWorker.js';
+import { startCleanupWorker, stopCleanupWorker } from './cleanupWorker.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
-import { setupWebsocketServer } from './websocket.js';
+import { setupWebsocketServer, closeWebsocketServer } from './websocket.js';
 import { initializeCompileService } from './services/compileService.js';
 import adminRoute from './routes/admin.js';
 import metricsRoute, { requestLatency } from './routes/metrics.js';
@@ -39,6 +39,7 @@ import { setupGraphQL } from './graphql/index.js';
 import {
   initializeDatabase,
   refreshDatabaseConnection,
+  closeDatabase,
 } from './database/connection.js';
 import { compressionMiddleware } from './middleware/compressionMiddleware.js';
 import feeEngineRoute from './routes/feeEngine.js';
@@ -47,13 +48,19 @@ import featureFlagService from './services/featureFlagService.js';
 import { LedgerSyncService } from './services/ledgerSyncService.js';
 import snippetsRoute from './routes/snippets.js';
 import deployQueueRoute from './routes/deployQueue.js';
+import { startWebhookDispatcher, stopWebhookDispatcher } from './services/webhookDispatcher.js';
+import { webhooksRoute } from './routes/webhooks.js';
+import corsAdminRoute from './routes/corsAdmin.js';
+import serviceRegistryRoute from './routes/serviceRegistry.js';
+import batchSubmitterRoute from './routes/batchSubmitter.js';
+import { setupSwagger } from './docs/swagger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const server = http.createServer(app);
-applyServerTuning(server); // HTTP/2: keep-alive + headers-timeout tuning
+let httpServer = http.createServer(app);
+applyServerTuning(httpServer); // HTTP/2: keep-alive + headers-timeout tuning
 
 // TLS/SSL Hardening configuration
 const httpsOptions = {
@@ -98,7 +105,7 @@ try {
 // Fallback to HTTP if no certs are provided, otherwise use HTTPS
 const server = hasCertificates
   ? https.createServer(httpsOptions, app)
-  : http.createServer(app);
+  : httpServer;
 const PORT = process.env.PORT || 5000;
 
 // Load package.json for version info
@@ -308,6 +315,8 @@ function setupCredentialRotation() {
   credentialRotationService.start();
 }
 
+let ledgerSyncServiceInstance = null;
+
 // WebSocket + compile service + database init
 initializeDatabase()
   .then((db) => {
@@ -319,7 +328,8 @@ initializeDatabase()
     startWebhookDispatcher();
     setupCredentialRotation();
     if (process.env.LEDGER_SYNC_ENABLED === 'true') {
-      new LedgerSyncService({ db }).start();
+      ledgerSyncServiceInstance = new LedgerSyncService({ db });
+      ledgerSyncServiceInstance.start();
     }
 
     // Start listening
@@ -336,9 +346,54 @@ initializeDatabase()
   });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('Shutting down gracefully...');
-  server.close(() => process.exit(0));
-});
+let isShuttingDown = false;
+const SHUTDOWN_TIMEOUT_MS = 30000;
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`\n[Shutdown] Received ${signal}. Starting graceful shutdown...`);
+
+  const forceExit = setTimeout(() => {
+    console.error('[Shutdown] Graceful shutdown timed out after 30s. Force exiting.');
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+
+  try {
+    // 1. Stop background workers
+    console.log('[Shutdown] Stopping background workers...');
+    stopCleanupWorker();
+    stopWebhookDispatcher();
+    if (ledgerSyncServiceInstance) ledgerSyncServiceInstance.stop();
+    await oracleWorkerPool.stop();
+    credentialRotationService.stop();
+
+    // 2. Stop accepting new HTTP requests
+    console.log('[Shutdown] Stopping HTTP server...');
+    await new Promise((resolve) => server.close(resolve));
+
+    // 3. Stop WebSocket connections
+    console.log('[Shutdown] Closing WebSocket server...');
+    closeWebsocketServer();
+
+    // 4. Close database and Redis connections
+    console.log('[Shutdown] Closing database and Redis connections...');
+    await closeDatabase();
+    if (redisService.client) {
+      await redisService.client.quit();
+    }
+
+    console.log('[Shutdown] Graceful shutdown completed cleanly.');
+    clearTimeout(forceExit);
+    process.exit(0);
+  } catch (err) {
+    console.error('[Shutdown] Error during shutdown:', err);
+    clearTimeout(forceExit);
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 export default app;
