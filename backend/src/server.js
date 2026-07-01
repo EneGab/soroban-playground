@@ -66,6 +66,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 let httpServer = http.createServer(app);
 applyServerTuning(httpServer); // HTTP/2: keep-alive + headers-timeout tuning
+let server;
 
 // TLS/SSL Hardening configuration
 const httpsOptions = {
@@ -108,7 +109,7 @@ try {
 }
 
 // Fallback to HTTP if no certs are provided, otherwise use HTTPS
-const server = hasCertificates
+server = hasCertificates
   ? https.createServer(httpsOptions, app)
   : httpServer;
 const PORT = process.env.PORT || 5000;

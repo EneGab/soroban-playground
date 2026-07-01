@@ -9,7 +9,7 @@ import { sharedOracleEventBus } from './services/oracle/oracleEvents.js';
 const clients = new Set();
 
 const HEARTBEAT_INTERVAL_MS = 30_000; // ping every 30 s
-const MAX_MISSED_PONGS = 2;           // terminate after 2 consecutive misses
+const MAX_MISSED_PONGS = 2; // terminate after 2 consecutive misses
 
 function safeSend(socket, message) {
   try {
